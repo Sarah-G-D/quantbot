@@ -1,0 +1,6 @@
+*.parquet
+pricer-output-*/
+__pycache__/
+*.pyc
+sentiment_regime.json
+.env
