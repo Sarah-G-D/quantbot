@@ -15,7 +15,7 @@ from strategies.bot5 import Bot5
 
 class FiveBotAlphaCouncil:
     def __init__(self):
-        self.price_histories = {} # {symbol: [list of historical prices]}
+        self.price_histories = {}  # {symbol: [list of historical prices]}
         self.bot1 = Bot1()
         self.bot2 = Bot2()
         self.bot3 = Bot3()
@@ -28,7 +28,7 @@ class FiveBotAlphaCouncil:
             self.price_histories[symbol] = []
         self.price_histories[symbol].append(mid_price)
         
-        # Limit history length to 100 to prevent memory leaks [1]
+        # Limit history length to 100 to prevent memory leaks
         if len(self.price_histories[symbol]) > 100:
             self.price_histories[symbol].pop(0)
 
@@ -42,7 +42,7 @@ class FiveBotAlphaCouncil:
         v3 = self.bot3.evaluate(mid_price, history)
         v4 = self.bot4.evaluate(history)
         
-        # Compile latest mid prices for the lead-lag calculations [1]
+        # Compile latest mid prices for the lead-lag calculations
         current_prices = {}
         for sym, hist in self.price_histories.items():
             if hist:
@@ -58,7 +58,7 @@ class FiveBotAlphaCouncil:
         final_signal = "HOLD"
         vote_strength = 0
         
-        # Consensus gate: requires a majority of 3+ agreement [1]
+        # Consensus gate: requires a majority of 3+ agreement
         if buy_count >= 3 and buy_count > sell_count:
             final_signal = "BUY"
             vote_strength = buy_count
