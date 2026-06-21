@@ -2,7 +2,6 @@
 import time
 import json
 import os
-import requests
 import pandas as pd
 import MetaTrader5 as mt5
 import logfire
@@ -23,33 +22,29 @@ ALLOWED_ASSETS = [
 ]
 
 # ---------------------------------------------------------------------------
-# NORTHFLANK CONFIGURATION
+# SENTIMENT CONFIGURATION (Bypassed for safe launch at 22:00)
 # ---------------------------------------------------------------------------
-# If you are running both locally, this defaults to 'http://127.0.0.1:8000/sentiment'.
-# Once you deploy to Northflank, change this URL to your Northflank web service address.
-NORTHFLANK_URL = os.getenv("SENTIMENT_API_URL", "http://127.0.0.1:8000/sentiment")
-SENTIMENT_FILE = "sentiment_regime.json"
+# When you are ready to use your Northflank service, uncomment this URL and 
+# update the load_sentiment_bias() function below to make the HTTP request.
+# NORTHFLANK_URL = "https://your-service-subdomain.code.northflank.com/sentiment"
 
 def load_sentiment_bias() -> str:
-    """Fetches real-time market sentiment bias from your Northflank web service,
-
-    with fallbacks to a local file and a safe default ('NEUTRAL').
+    """Returns 'NEUTRAL' instantly to protect the execution loop from timeout delays.
+    
+    Once your Northflank server is running, you can replace the return statement 
+    with the API call block below.
     """
-    try:
-        response = requests.get(NORTHFLANK_URL, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            return data.get("bias", "NEUTRAL")
-    except Exception:
-        # If the API server is offline or not yet deployed, fallback to local JSON file
-        if os.path.exists(SENTIMENT_FILE):
-            try:
-                with open(SENTIMENT_FILE, "r") as f:
-                    data = json.load(f)
-                    return data.get("bias", "NEUTRAL")
-            except Exception:
-                pass
     return "NEUTRAL"
+
+    # --- UNCOMMENT THE CODE BELOW LATER TO ACTIVATE LIVE SENTIMENT ---
+    # try:
+    #     import requests
+    #     response = requests.get(NORTHFLANK_URL, timeout=1.5)
+    #     if response.status_code == 200:
+    #         return response.json().get("bias", "NEUTRAL")
+    # except Exception:
+    #     pass
+    # return "NEUTRAL"
 # ---------------------------------------------------------------------------
 
 def get_live_book_imbalance(symbol: str) -> float:
@@ -62,9 +57,12 @@ def get_live_book_imbalance(symbol: str) -> float:
     total_asks = 0.0
     
     for item in items:
-        if item.type in [mt5.BOOK_TYPE_BUY, mt5.BOOK_TYPE_BUY_LIMIT]:
+        # Corrected MT5 Python attributes:
+        # BOOK_TYPE_BUY (bids/limits) and BOOK_TYPE_BUY_MARKET
+        if item.type in [mt5.BOOK_TYPE_BUY, mt5.BOOK_TYPE_BUY_MARKET]:
             total_bids += item.volume_dbl if hasattr(item, 'volume_dbl') else item.volume
-        elif item.type in [mt5.BOOK_TYPE_SELL, mt5.BOOK_TYPE_SELL_LIMIT]:
+        # BOOK_TYPE_SELL (asks/limits) and BOOK_TYPE_SELL_MARKET
+        elif item.type in [mt5.BOOK_TYPE_SELL, mt5.BOOK_TYPE_SELL_MARKET]:
             total_asks += item.volume_dbl if hasattr(item, 'volume_dbl') else item.volume
             
     if (total_bids + total_asks) > 0:
@@ -125,6 +123,7 @@ def live_trading_loop():
     
     warmup_council_histories(council)
     
+    # Subscribe to Depth of Market books
     for symbol in ALLOWED_ASSETS:
         if mt5.market_book_add(symbol):
             print(f"✅ Subscribed to order book depth for {symbol}")
@@ -133,9 +132,10 @@ def live_trading_loop():
     
     try:
         while True:
-            # Read global macro sentiment live from your API or local file
+            # Read global macro sentiment live (currently mocked to return 'NEUTRAL' instantly)
             sentiment_bias = load_sentiment_bias()
             
+            # Apply sentiment skew directly to strategy properties inside the council
             if sentiment_bias == "BULLISH":
                 council.bot1.threshold = 0.25 
                 council.bot3.z_threshold = 2.8 
@@ -179,6 +179,7 @@ def live_trading_loop():
                     else:
                         current_return = (entry_price - mid_price) / entry_price
                         
+                    # Rule-based exit targets: Profit Target (+0.2%) or Stop Loss (-0.1%)
                     if current_return >= 0.002 or current_return <= -0.001:
                         close_action = "SELL" if direction == "BUY" else "BUY"
                         print(f"🛑 [Exit Signal] Closing {symbol} position...")
@@ -205,12 +206,14 @@ def live_trading_loop():
                         
                         if is_safe:
                             trade_volume = trade_size_cash / mid_price
+                            # Standard MT5 Lot sizes: $100k exposure is roughly 1 lot
                             mt5_lot_size = round(trade_volume / 100000.0, 2) 
                             
                             if mt5_lot_size > 0:
                                 print(f"🚀 [Entry Signal] Executing {signal} for {symbol} with lots {mt5_lot_size}...")
                                 execute_mt5_order(symbol, signal, mt5_lot_size, mid_price, comment="Council Consensus")
             
+            # Control loop frequency
             time.sleep(1) 
             
     except KeyboardInterrupt:
