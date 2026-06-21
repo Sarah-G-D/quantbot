@@ -2,6 +2,7 @@
 import time
 import json
 import os
+import requests
 import pandas as pd
 import MetaTrader5 as mt5
 import logfire
@@ -22,29 +23,11 @@ ALLOWED_ASSETS = [
 ]
 
 # ---------------------------------------------------------------------------
-# SENTIMENT CONFIGURATION (Bypassed for safe launch at 22:00)
+# SENTIMENT CONFIGURATION (Bypassed for safe launch)
 # ---------------------------------------------------------------------------
-# When you are ready to use your Northflank service, uncomment this URL and 
-# update the load_sentiment_bias() function below to make the HTTP request.
-# NORTHFLANK_URL = "https://your-service-subdomain.code.northflank.com/sentiment"
-
 def load_sentiment_bias() -> str:
-    """Returns 'NEUTRAL' instantly to protect the execution loop from timeout delays.
-    
-    Once your Northflank server is running, you can replace the return statement 
-    with the API call block below.
-    """
+    """Returns 'NEUTRAL' instantly to protect the execution loop from timeout delays."""
     return "NEUTRAL"
-
-    # --- UNCOMMENT THE CODE BELOW LATER TO ACTIVATE LIVE SENTIMENT ---
-    # try:
-    #     import requests
-    #     response = requests.get(NORTHFLANK_URL, timeout=1.5)
-    #     if response.status_code == 200:
-    #         return response.json().get("bias", "NEUTRAL")
-    # except Exception:
-    #     pass
-    # return "NEUTRAL"
 # ---------------------------------------------------------------------------
 
 def get_live_book_imbalance(symbol: str) -> float:
@@ -57,11 +40,9 @@ def get_live_book_imbalance(symbol: str) -> float:
     total_asks = 0.0
     
     for item in items:
-        # Corrected MT5 Python attributes:
-        # BOOK_TYPE_BUY (bids/limits) and BOOK_TYPE_BUY_MARKET
+        # Corrected MT5 Python attributes to prevent AttributeError
         if item.type in [mt5.BOOK_TYPE_BUY, mt5.BOOK_TYPE_BUY_MARKET]:
             total_bids += item.volume_dbl if hasattr(item, 'volume_dbl') else item.volume
-        # BOOK_TYPE_SELL (asks/limits) and BOOK_TYPE_SELL_MARKET
         elif item.type in [mt5.BOOK_TYPE_SELL, mt5.BOOK_TYPE_SELL_MARKET]:
             total_asks += item.volume_dbl if hasattr(item, 'volume_dbl') else item.volume
             
@@ -95,13 +76,17 @@ def execute_mt5_order(symbol: str, action: str, volume: float, price: float, com
         "magic": 123456, 
         "comment": comment,
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC, 
+        "type_filling": mt5.ORDER_FILLING_FOK, # Corrected: universally supported fill mode
     }
     
     result = mt5.order_send(request)
+    if result is None:
+         print(f"❌ MT5 Order Failed: order_send returned None for {symbol}")
+         return None
+
     if result.retcode != mt5.TRADE_RETCODE_DONE:
         logfire.error("MT5 Order Failed", symbol=symbol, action=action, error=result.comment, retcode=result.retcode)
-        print(f"❌ MT5 Order Failed for {symbol}: {result.comment}")
+        print(f"❌ MT5 Order Failed for {symbol}: Retcode {result.retcode} - {result.comment}")
     else:
         logfire.notice("MT5 Order Executed Successfully", symbol=symbol, action=action, price=result.price, volume=volume)
         print(f"🎯 Successful {action} order executed on {symbol} at {result.price}")
@@ -132,7 +117,6 @@ def live_trading_loop():
     
     try:
         while True:
-            # Read global macro sentiment live (currently mocked to return 'NEUTRAL' instantly)
             sentiment_bias = load_sentiment_bias()
             
             # Apply sentiment skew directly to strategy properties inside the council
@@ -174,16 +158,20 @@ def live_trading_loop():
                     entry_price = pos.price_open
                     direction = "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
                     
+                    # Calculate correct percentage return based on executable order book sides
                     if direction == "BUY":
-                        current_return = (mid_price - entry_price) / entry_price
+                        # We close a BUY position by SELLING at the BID price
+                        current_return = (tick.bid - entry_price) / entry_price
                     else:
-                        current_return = (entry_price - mid_price) / entry_price
+                        # We close a SELL position by BUYING at the ASK price
+                        current_return = (entry_price - tick.ask) / entry_price
                         
-                    # Rule-based exit targets: Profit Target (+0.2%) or Stop Loss (-0.1%)
-                    if current_return >= 0.002 or current_return <= -0.001:
+                    # Widen brackets to +1.0% (Profit) and -0.5% (Stop Loss) to let trades breathe
+                    if current_return >= 0.010 or current_return <= -0.005:
                         close_action = "SELL" if direction == "BUY" else "BUY"
+                        close_price = tick.bid if direction == "BUY" else tick.ask
                         print(f"🛑 [Exit Signal] Closing {symbol} position...")
-                        execute_mt5_order(symbol, close_action, pos.volume, mid_price, comment="Exit Bracket")
+                        execute_mt5_order(symbol, close_action, pos.volume, close_price, comment="Exit Bracket")
                         
                 # --- ENTRY EVALUATION ---
                 else:
@@ -211,7 +199,9 @@ def live_trading_loop():
                             
                             if mt5_lot_size > 0:
                                 print(f"🚀 [Entry Signal] Executing {signal} for {symbol} with lots {mt5_lot_size}...")
-                                execute_mt5_order(symbol, signal, mt5_lot_size, mid_price, comment="Council Consensus")
+                                # Execute entry order on the correct book side: BUY at Ask, SELL at Bid
+                                entry_price_exec = tick.ask if signal == "BUY" else tick.bid
+                                execute_mt5_order(symbol, signal, mt5_lot_size, entry_price_exec, comment="Council Consensus")
             
             # Control loop frequency
             time.sleep(1) 
