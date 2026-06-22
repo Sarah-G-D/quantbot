@@ -8,6 +8,8 @@ import numpy as np
 import MetaTrader5 as mt5
 import logfire
 from datetime import datetime, timedelta, timezone
+
+# Import your custom modules
 from alpha_agent import FiveBotAlphaCouncil
 from risk_agent import AssetRiskGuard, AccountState
 
@@ -28,9 +30,13 @@ def load_sentiment_bias() -> str:
     return "NEUTRAL"
 
 def get_current_bst_time() -> datetime:
-    """Returns current BST (London) time using pure standard library."""
+    """
+    Returns current BST (London) time as a timezone-naive datetime 
+    to prevent offset-aware/naive comparison crashes with other standard libraries.
+    """
     utc_now = datetime.now(timezone.utc)
-    return utc_now + timedelta(hours=1)
+    bst_now = utc_now + timedelta(hours=1)
+    return bst_now.replace(tzinfo=None)
 
 def get_symbol_filling_mode(symbol: str) -> int:
     """Dynamically queries the MT5 terminal for the broker's supported filling mode."""
@@ -83,17 +89,33 @@ def get_live_book_imbalance(symbol: str) -> float:
         return (total_bids - total_asks) / (total_bids + total_asks)
     return 0.0
 
-def warmup_council_histories(council: FiveBotAlphaCouncil):
-    """Fills history with the latest M1 close bars to avoid waiting for initial warmups."""
-    print("⏳ Warming up asset price histories using MT5 M1 bars...")
+def warmup_council_histories(council: FiveBotAlphaCouncil, symbol_atrs: dict):
+    """Fills history with latest M1 bars and estimates historical volatility (ATR)."""
+    print("⏳ Warming up asset price histories and calculating ATR...")
     for symbol in ALLOWED_ASSETS:
         rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 100)
         if rates is not None and len(rates) > 0:
             prices = [float(candle['close']) for candle in rates]
             council.price_histories[symbol] = prices
-            print(f"   Warmup complete for {symbol}: Loaded {len(prices)} bars.")
+            
+            # Compute a basic 14-period M1 ATR for volatility-adjusted stops
+            highs = np.array([r['high'] for r in rates])
+            lows = np.array([r['low'] for r in rates])
+            closes = np.array([r['close'] for r in rates])
+            
+            tr = []
+            for i in range(1, len(rates)):
+                h_l = highs[i] - lows[i]
+                h_pc = abs(highs[i] - closes[i-1])
+                l_pc = abs(lows[i] - closes[i-1])
+                tr.append(max(h_l, h_pc, l_pc))
+            
+            atr_val = float(np.mean(tr[-14:])) if len(tr) >= 14 else 0.00015
+            symbol_atrs[symbol] = max(atr_val, 0.00005)  # Floor at 0.5 pips
+            print(f"   Warmup complete for {symbol}: Loaded {len(prices)} bars. M1 ATR: {symbol_atrs[symbol]:.5f}")
         else:
-            print(f"   ⚠️ Warmup skipped/failed for {symbol}. Will accumulate live ticks.")
+            print(f"   ⚠️ Warmup skipped/failed for {symbol}. Using default ATR.")
+            symbol_atrs[symbol] = 0.00015
 
 def execute_mt5_order(symbol: str, action: str, volume: float, price: float, comment: str = ""):
     """Submits a market execution order directly to the MetaTrader 5 terminal."""
@@ -106,7 +128,7 @@ def execute_mt5_order(symbol: str, action: str, volume: float, price: float, com
         "volume": volume,
         "type": order_type,
         "price": price,
-        "deviation": 20, 
+        "deviation": 30,  # Increased deviation slightly to prevent dynamic order rejections
         "magic": 123456, 
         "comment": comment,
         "type_time": mt5.ORDER_TIME_GTC,
@@ -128,7 +150,7 @@ def execute_mt5_order(symbol: str, action: str, volume: float, price: float, com
 
 def live_trading_loop():
     print("==================================================")
-    print("      QUANTBOT METATRADER 5 LIVE ORCHESTRATOR     ")
+    print("   QUANTBOT METATRADER 5 FOREX-ONLY ORCHESTRATOR  ")
     print("==================================================")
     
     if not mt5.initialize():
@@ -140,7 +162,8 @@ def live_trading_loop():
     council = FiveBotAlphaCouncil()
     guard = AssetRiskGuard()
     
-    warmup_council_histories(council)
+    symbol_atrs = {}
+    warmup_council_histories(council, symbol_atrs)
     
     for symbol in ALLOWED_ASSETS:
         if mt5.market_book_add(symbol):
@@ -150,8 +173,10 @@ def live_trading_loop():
     
     try:
         while True:
-            # --- SAFEGUARD: AUTO-FLAT 21:45 BST END-OF-ROUND RULE ---
+            # Synchronize to the correct naive BST timezone to feed the risk guard [1]
             now_bst = get_current_bst_time()
+            
+            # --- SAFEGUARD: AUTO-FLAT 21:45 BST END-OF-ROUND RULE ---
             if now_bst.hour == 21 and now_bst.minute >= 45:
                 active_positions = mt5.positions_get()
                 if active_positions and len(active_positions) > 0:
@@ -170,6 +195,7 @@ def live_trading_loop():
 
             sentiment_bias = load_sentiment_bias()
             
+            # Dynamically optimize thresholds
             if sentiment_bias == "BULLISH":
                 council.bot1.threshold = 0.25 
                 council.bot3.z_threshold = 2.8 
@@ -177,7 +203,7 @@ def live_trading_loop():
                 council.bot1.threshold = 0.45 
                 council.bot3.z_threshold = 2.2 
             else:
-                council.bot1.threshold = 0.45  # Keeps CV-optimized defaults
+                council.bot1.threshold = 0.45  
                 council.bot3.z_threshold = 2.5 
             
             acct = mt5.account_info()
@@ -238,8 +264,8 @@ def live_trading_loop():
                 net_directional_exposure=net_directional_exposure
             )
             
-            # Continuously analyze and log compliance status
-            guard.evaluate_compliance_violations(current_state, pd.Timestamp.now())
+            # Feed state to persistent risk agent
+            guard.evaluate_compliance_violations(current_state, now_bst)
             
             # ---------------------------------------------------------------------------
             # ACTIVE MARGIN SHIELD: PREVENTS BREACHING THE 98% COMPLIANCE REVIEW RED-LINE [1]
@@ -247,9 +273,8 @@ def live_trading_loop():
             current_margin_usage = acct.margin / acct.equity if acct.equity > 0 else 0.0
             if current_margin_usage >= 0.97 and len(positions) > 0:
                 print(f"⚠️ CRITICAL WARNING: Margin usage is at {current_margin_usage*100:.2f}%.")
-                print("🚨 Force-closing the largest open position to prevent crossing the 98% review limit!")
+                print("🚨 Force-closing largest open position to protect compliance score!")
                 
-                # Find the position carrying the largest volume load
                 largest_pos = max(positions, key=lambda p: p.volume)
                 symbol_to_close = largest_pos.symbol
                 direction_to_close = "BUY" if largest_pos.type == mt5.POSITION_TYPE_BUY else "SELL"
@@ -263,16 +288,28 @@ def live_trading_loop():
                         close_price, comment="Margin Shield Close"
                     )
                 time.sleep(1)
-                continue  # Skip evaluation during this cycle to allow the order to settle
+                continue  
 
+            # ---------------------------------------------------------------------------
+            # PASS 1: SYNCHRONIZE TICK PRICES AND HISTORIES (CRITICAL FOR LEAD-LAG)
+            # ---------------------------------------------------------------------------
+            current_ticks = {}
             for symbol in ALLOWED_ASSETS:
                 tick = mt5.symbol_info_tick(symbol)
+                if tick is not None:
+                    current_ticks[symbol] = tick
+                    mid_price = (tick.bid + tick.ask) / 2.0
+                    council.update_price(symbol, mid_price)
+
+            # ---------------------------------------------------------------------------
+            # PASS 2: SYNCED TRADE EVALUATION (ENTRIES & EXITS)
+            # ---------------------------------------------------------------------------
+            for symbol in ALLOWED_ASSETS:
+                tick = current_ticks.get(symbol)
                 if tick is None:
                     continue
                     
                 mid_price = (tick.bid + tick.ask) / 2.0
-                council.update_price(symbol, mid_price)
-                
                 positions_for_symbol = mt5.positions_get(symbol=symbol)
                 if positions_for_symbol is None:
                     positions_for_symbol = ()
@@ -288,6 +325,11 @@ def live_trading_loop():
                     else:
                         current_return = (entry_price - tick.ask) / entry_price
                         
+                    # Calculate dynamic targets using current ATR
+                    atr = symbol_atrs.get(symbol, 0.00015)
+                    sl_pct = (atr * 3.5) / entry_price  # 3.5x ATR Stop Loss
+                    tp_pct = (atr * 6.0) / entry_price  # 6.0x ATR Take Profit
+                    
                     live_imbalance = get_live_book_imbalance(symbol)
                     mock_row = {
                         'bid': tick.bid,
@@ -299,11 +341,11 @@ def live_trading_loop():
                     
                     reversal_triggered = (direction == "BUY" and signal == "SELL") or (direction == "SELL" and signal == "BUY")
                     
-                    if current_return >= 0.010 or current_return <= -0.005 or reversal_triggered:
+                    if current_return >= tp_pct or current_return <= -sl_pct or reversal_triggered:
                         close_action = "SELL" if direction == "BUY" else "BUY"
                         close_price = tick.bid if direction == "BUY" else tick.ask
                         reason = "Exit Bracket" if not reversal_triggered else "Council Reversal"
-                        print(f"🛑 [Exit Signal] Closing {symbol} position due to {reason}...")
+                        print(f"🛑 [Exit Signal] Closing {symbol} due to {reason}. Return: {current_return*100:.4f}%")
                         execute_mt5_order(symbol, close_action, pos.volume, close_price, comment=reason)
                         
                 # --- ENTRY EVALUATION ---
@@ -319,10 +361,25 @@ def live_trading_loop():
                     signal = analysis.get("signal")
                     
                     if signal in ["BUY", "SELL"]:
-                        trade_size_cash = 1000000.0 
+                        # 1. Spread Filter Guard
+                        atr = symbol_atrs.get(symbol, 0.00015)
+                        current_spread = tick.ask - tick.bid
+                        if current_spread > (atr * 1.5):
+                            print(f"⚠️ Entry blocked for {symbol}: Spread too wide ({current_spread:.5f} > max {atr*1.5:.5f})")
+                            continue
+
+                        # 2. Dynamic Risk Sizing (Risking 0.5% of Equity relative to SL)
+                        risk_percentage = 0.005  
+                        risk_usd = acct.equity * risk_percentage
+                        sl_distance_price = atr * 3.5
                         
-                        current_time = pd.Timestamp.now()
-                        is_safe = guard.validate_trade(current_state, symbol, trade_size_cash, current_time)
+                        trade_size_cash = (risk_usd / sl_distance_price) * mid_price
+                        
+                        # Limit to max 4x leverage to never trigger your risk agent's strict FOREX limit (5.0x)
+                        max_allowed_cash = acct.equity * 4.0
+                        trade_size_cash = min(trade_size_cash, max_allowed_cash)
+                        
+                        is_safe = guard.validate_trade(current_state, symbol, trade_size_cash, now_bst)
                         
                         if is_safe:
                             mt5_lot_size = calculate_mt5_lot_size(symbol, trade_size_cash, mid_price)
