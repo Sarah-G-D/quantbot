@@ -7,13 +7,12 @@ class Bot5:
     """
     def __init__(self, threshold_pct: float = 0.0005):
         self.threshold_pct = threshold_pct
-        # Correlation mapping: {lagging_asset: leading_asset}
+        # Expanded to cover your active Forex list lagging the EURUSD benchmark
         self.lead_lag_map = {
             "GBPUSD": "EURUSD",
-            "XAGUSD": "XAUUSD",
-            "ETHUSD": "BTCUSD",
-            "SOLUSD": "BTCUSD",
-            "XRPUSD": "BTCUSD"
+            "AUDUSD": "EURUSD",
+            "EURCHF": "EURUSD",
+            "EURGBP": "EURUSD"
         }
 
     def evaluate(self, symbol: str, current_prices: dict, price_histories: dict) -> str:
@@ -25,7 +24,6 @@ class Bot5:
         if len(leader_history) < 2:
             return "HOLD"
             
-        # Compare the last two recorded mid prices
         leader_prev = leader_history[-2]
         leader_curr = leader_history[-1]
         
