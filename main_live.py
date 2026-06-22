@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 import MetaTrader5 as mt5
 import logfire
-from datetime import datetime, timedelta, timezone  # Uses pure standard library
+from datetime import datetime, timedelta, timezone
 from alpha_agent import FiveBotAlphaCouncil
 from risk_agent import AssetRiskGuard, AccountState
 
@@ -24,17 +24,12 @@ ALLOWED_ASSETS = [
     "BARUSD", "BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD"
 ]
 
-# ---------------------------------------------------------------------------
-# SENTIMENT CONFIGURATION (Bypassed for safe launch)
-# ---------------------------------------------------------------------------
 def load_sentiment_bias() -> str:
     """Returns 'NEUTRAL' instantly to protect the execution loop from timeout delays."""
     return "NEUTRAL"
-# ---------------------------------------------------------------------------
 
 def get_current_bst_time() -> datetime:
-    """Returns current BST (London) time using pure standard library (no pytz required)."""
-    # BST in June is UTC + 1 hour
+    """Returns current BST (London) time using pure standard library."""
     utc_now = datetime.now(timezone.utc)
     return utc_now + timedelta(hours=1)
 
@@ -42,9 +37,8 @@ def get_symbol_filling_mode(symbol: str) -> int:
     """Dynamically queries the MT5 terminal for the broker's supported filling mode."""
     info = mt5.symbol_info(symbol)
     if info is None:
-        return mt5.ORDER_FILLING_FOK  # Fallback
+        return mt5.ORDER_FILLING_FOK
     
-    # Check bitmask flags for supported modes
     if (info.filling_mode & 1) != 0: 
         return mt5.ORDER_FILLING_FOK
     elif (info.filling_mode & 2) != 0: 
@@ -55,24 +49,17 @@ def get_symbol_filling_mode(symbol: str) -> int:
 def calculate_mt5_lot_size(symbol: str, trade_size_cash: float, mid_price: float) -> float:
     """Calculates MT5 lot size using dynamic contract size and volume limits."""
     info = mt5.symbol_info(symbol)
-    if info is None:
+    if info is None or mid_price <= 0:
         return 0.0
     
-    # Get the contract size (e.g., 100,000 for Forex, 100 for Gold, 1 for BTC)
     contract_size = info.trade_contract_size
-    
-    # Calculate target units required
     target_units = trade_size_cash / mid_price
-    
-    # Convert units to lots based on the contract size of the asset
     raw_lots = target_units / contract_size
     
-    # Respect MT5 broker volume steps and limits
     lot_step = info.volume_step if info.volume_step > 0 else 0.01
     min_lot = info.volume_min if info.volume_min > 0 else 0.01
     max_lot = info.volume_max if info.volume_max > 0 else 100.0
     
-    # Round down to the nearest allowed lot step
     lots = round(raw_lots / lot_step) * lot_step
     lots = max(min_lot, min(max_lot, lots))
     
@@ -112,7 +99,6 @@ def warmup_council_histories(council: FiveBotAlphaCouncil):
 def execute_mt5_order(symbol: str, action: str, volume: float, price: float, comment: str = ""):
     """Submits a market execution order directly to the MetaTrader 5 terminal."""
     order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
-    
     filling_mode = get_symbol_filling_mode(symbol)
     
     request = {
@@ -157,7 +143,6 @@ def live_trading_loop():
     
     warmup_council_histories(council)
     
-    # Subscribe to Depth of Market books
     for symbol in ALLOWED_ASSETS:
         if mt5.market_book_add(symbol):
             print(f"✅ Subscribed to order book depth for {symbol}")
@@ -166,15 +151,12 @@ def live_trading_loop():
     
     try:
         while True:
-            # ---------------------------------------------------------------------------
-            # SAFEGUARD: AUTO-FLAT 21:45 BST END-OF-ROUND RULE
-            # ---------------------------------------------------------------------------
+            # --- SAFEGUARD: AUTO-FLAT 21:45 BST END-OF-ROUND RULE ---
             now_bst = get_current_bst_time()
             if now_bst.hour == 21 and now_bst.minute >= 45:
-                # Check if we have active positions to close
                 active_positions = mt5.positions_get()
                 if active_positions and len(active_positions) > 0:
-                    print("🕒 Approaching Round 1 Cutoff (22:00 BST). Flattening all positions to lock in rank...")
+                    print("🕒 Approaching Round Cutoff (22:00 BST). Flattening all positions to lock in rank...")
                     for pos in active_positions:
                         symbol = pos.symbol
                         direction = "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
@@ -183,14 +165,12 @@ def live_trading_loop():
                         if tick is not None:
                             close_price = tick.bid if direction == "BUY" else tick.ask
                             execute_mt5_order(symbol, close_action, pos.volume, close_price, comment="Cutoff Flat")
-                    print("✅ All positions flattened. Standing secured for Round 1 snapshot.")
+                    print("✅ All positions flattened.")
                 time.sleep(5)
                 continue
-            # ---------------------------------------------------------------------------
 
             sentiment_bias = load_sentiment_bias()
             
-            # Apply sentiment skew directly to strategy properties inside the council
             if sentiment_bias == "BULLISH":
                 council.bot1.threshold = 0.25 
                 council.bot3.z_threshold = 2.8 
@@ -198,7 +178,7 @@ def live_trading_loop():
                 council.bot1.threshold = 0.45 
                 council.bot3.z_threshold = 2.2 
             else:
-                council.bot1.threshold = 0.35 
+                council.bot1.threshold = 0.45  # Keeps CV-optimized defaults
                 council.bot3.z_threshold = 2.5 
             
             acct = mt5.account_info()
@@ -207,13 +187,90 @@ def live_trading_loop():
                 time.sleep(1)
                 continue
                 
+            # ---------------------------------------------------------------------------
+            # COMPUTE DYNAMIC PORTFOLIO EXPOSURES & DIRECTION
+            # ---------------------------------------------------------------------------
+            positions = mt5.positions_get()
+            if positions is None:
+                positions = ()
+                
+            gross_exposure = 0.0
+            total_long_exposure = 0.0
+            total_short_exposure = 0.0
+            asset_exposures = {}
+            
+            for pos in positions:
+                symbol = pos.symbol
+                info = mt5.symbol_info(symbol)
+                if info is not None:
+                    contract_size = info.trade_contract_size
+                    price = pos.price_current
+                    
+                    # Convert exposure to absolute USD value
+                    if symbol in ["USDCAD", "USDCHF", "USDJPY"]:
+                        exposure_usd = pos.volume * contract_size
+                    elif symbol in ["EURCHF", "EURGBP"]:
+                        eurusd_tick = mt5.symbol_info_tick("EURUSD")
+                        eurusd_price = (eurusd_tick.bid + eurusd_tick.ask) / 2.0 if eurusd_tick else 1.08
+                        exposure_usd = pos.volume * contract_size * eurusd_price
+                    else:
+                        exposure_usd = pos.volume * contract_size * price
+                    
+                    gross_exposure += exposure_usd
+                    
+                    if pos.type == mt5.POSITION_TYPE_BUY:
+                        total_long_exposure += exposure_usd
+                    else:
+                        total_short_exposure += exposure_usd
+                        
+                    clean_sym = symbol.replace("/", "").replace("_", "")
+                    asset_exposures[clean_sym] = asset_exposures.get(clean_sym, 0.0) + exposure_usd
+
+            net_directional_exposure = (
+                abs(total_long_exposure - total_short_exposure) / gross_exposure 
+                if gross_exposure > 0 else 0.0
+            )
+
             current_state = AccountState(
                 equity=acct.equity,
                 used_margin=acct.margin,
-                gross_exposure=acct.margin_initial 
+                gross_exposure=gross_exposure,
+                asset_exposures=asset_exposures,
+                net_directional_exposure=net_directional_exposure
             )
             
+            # Continuously analyze and log compliance status
+            guard.evaluate_compliance_violations(current_state, pd.Timestamp.now())
+            
+            # ---------------------------------------------------------------------------
+            # ACTIVE MARGIN SHIELD: PREVENTS BREACHING THE 98% COMPLIANCE REVIEW RED-LINE [1]
+            # ---------------------------------------------------------------------------
+            current_margin_usage = acct.margin / acct.equity if acct.equity > 0 else 0.0
+            if current_margin_usage >= 0.97 and len(positions) > 0:
+                print(f"⚠️ CRITICAL WARNING: Margin usage is at {current_margin_usage*100:.2f}%.")
+                print("🚨 Force-closing the largest open position to prevent crossing the 98% review limit!")
+                
+                # Find the position carrying the largest volume load
+                largest_pos = max(positions, key=lambda p: p.volume)
+                symbol_to_close = largest_pos.symbol
+                direction_to_close = "BUY" if largest_pos.type == mt5.POSITION_TYPE_BUY else "SELL"
+                close_action = "SELL" if direction_to_close == "BUY" else "BUY"
+                
+                tick_to_close = mt5.symbol_info_tick(symbol_to_close)
+                if tick_to_close is not None:
+                    close_price = tick_to_close.bid if direction_to_close == "BUY" else tick_to_close.ask
+                    execute_mt5_order(
+                        symbol_to_close, close_action, largest_pos.volume, 
+                        close_price, comment="Margin Shield Close"
+                    )
+                time.sleep(1)
+                continue  # Skip evaluation during this cycle to allow the order to settle
+
             for symbol in ALLOWED_ASSETS:
+                # Rule 14 Checklist: Bypass BARUSD completely to avoid illiquid execution slippage
+                if symbol == "BARUSD":
+                    continue
+
                 tick = mt5.symbol_info_tick(symbol)
                 if tick is None:
                     continue
@@ -221,21 +278,21 @@ def live_trading_loop():
                 mid_price = (tick.bid + tick.ask) / 2.0
                 council.update_price(symbol, mid_price)
                 
-                positions = mt5.positions_get(symbol=symbol)
+                positions_for_symbol = mt5.positions_get(symbol=symbol)
+                if positions_for_symbol is None:
+                    positions_for_symbol = ()
                 
                 # --- EXIT EVALUATION ---
-                if positions:
-                    pos = positions[0] 
+                if len(positions_for_symbol) > 0:
+                    pos = positions_for_symbol[0] 
                     entry_price = pos.price_open
                     direction = "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
                     
-                    # Calculate correct percentage return based on executable order book sides
                     if direction == "BUY":
                         current_return = (tick.bid - entry_price) / entry_price
                     else:
                         current_return = (entry_price - tick.ask) / entry_price
                         
-                    # Calculate live book imbalance to evaluate the current council consensus
                     live_imbalance = get_live_book_imbalance(symbol)
                     mock_row = {
                         'bid': tick.bid,
@@ -245,10 +302,8 @@ def live_trading_loop():
                     analysis = council.evaluate_market(mock_row, symbol)
                     signal = analysis.get("signal")
                     
-                    # Stateful reversal exit trigger
                     reversal_triggered = (direction == "BUY" and signal == "SELL") or (direction == "SELL" and signal == "BUY")
                     
-                    # Exit if brackets hit OR if council votes against us
                     if current_return >= 0.010 or current_return <= -0.005 or reversal_triggered:
                         close_action = "SELL" if direction == "BUY" else "BUY"
                         close_price = tick.bid if direction == "BUY" else tick.ask
@@ -259,7 +314,6 @@ def live_trading_loop():
                 # --- ENTRY EVALUATION ---
                 else:
                     live_imbalance = get_live_book_imbalance(symbol)
-                    
                     mock_row = {
                         'bid': tick.bid,
                         'ask': tick.ask,
@@ -276,7 +330,6 @@ def live_trading_loop():
                         is_safe = guard.validate_trade(current_state, symbol, trade_size_cash, current_time)
                         
                         if is_safe:
-                            # Use new dynamic lot calculation
                             mt5_lot_size = calculate_mt5_lot_size(symbol, trade_size_cash, mid_price)
                             
                             if mt5_lot_size > 0:
@@ -284,7 +337,6 @@ def live_trading_loop():
                                 entry_price_exec = tick.ask if signal == "BUY" else tick.bid
                                 execute_mt5_order(symbol, signal, mt5_lot_size, entry_price_exec, comment="Council Consensus")
             
-            # Control loop frequency
             time.sleep(1) 
             
     except KeyboardInterrupt:
@@ -296,4 +348,4 @@ def live_trading_loop():
         print("MetaTrader 5 connection closed.")
 
 if __name__ == "__main__":
-    live_trading_loop()
+    live_trading_loop()git add main_live.py risk_agent.py

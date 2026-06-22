@@ -1,5 +1,8 @@
+# risk_agent.py
 import pandas as pd
 import numpy as np
+import json
+import os
 from datetime import datetime, timedelta
 import time
 from pydantic import BaseModel, Field
@@ -25,6 +28,7 @@ class AccountState(BaseModel):
     used_margin: float = 0.0
     gross_exposure: float = 0.0
     asset_exposures: dict[str, float] = Field(default_factory=dict)
+    net_directional_exposure: float = 0.0
 
 class AssetRiskGuard:
     def __init__(self):
@@ -33,6 +37,7 @@ class AssetRiskGuard:
         self.HARD_DRAWDOWN_LIMIT = 0.14  
         self.margin_rates = {"FOREX": 0.0333, "METALS": 0.0500, "CRYPTO": 0.2000}
         
+        # Enforcing your preferred conservative leverage limits strictly
         self.max_leverage_limits = {
             "BTCUSD": 2.0, "ETHUSD": 2.0, "SOLUSD": 2.0, "XRPUSD": 2.0, "BARUSD": 2.0,
             "XAUUSD": 5.0, "XAGUSD": 5.0, "FOREX": 5.0
@@ -44,21 +49,55 @@ class AssetRiskGuard:
         
         self.margin_90_start = None
         self.margin_95_start = None
-        self.margin_98_start = None
         
         self.leverage_28_start = None
         self.leverage_29_start = None
-        self.leverage_30_start = None
         
         self.concentration_90_start = None
-        self.deductions_applied = set()
+        self.directional_95_start = None
         
+        self.deductions_applied = set()
         self.equity_history_15m = []
-        self.last_sharpe_time = None
+        self.last_sharpe_time = None  # Tracks the string of the last 15-min interval ID
         self.total_completed_trades = 0
         self.REQUIRED_TRADES_FOR_PRIZE = 30
         self.MAX_RPS = 450.0  
         self.request_timestamps = []
+        
+        self.history_file = "risk_guard_state.json"
+        self.load_state()
+
+    def save_state(self):
+        """Safely persists the live risk metrics to prevent data losses on crash/restart."""
+        try:
+            state_data = {
+                "peak_equity": self.peak_equity,
+                "max_drawdown": self.max_drawdown,
+                "risk_discipline_score": self.risk_discipline_score,
+                "equity_history_15m": self.equity_history_15m,
+                "last_sharpe_time": self.last_sharpe_time,
+                "deductions_applied": list(self.deductions_applied)
+            }
+            with open(self.history_file, 'w') as f:
+                json.dump(state_data, f, indent=4)
+        except Exception as e:
+            print(f"⚠️ Warning: Could not save risk state: {e}")
+
+    def load_state(self):
+        """Restores state metrics upon boot."""
+        if os.path.exists(self.history_file):
+            try:
+                with open(self.history_file, 'r') as f:
+                    state_data = json.load(f)
+                    self.peak_equity = state_data.get("peak_equity", 1000000.0)
+                    self.max_drawdown = state_data.get("max_drawdown", 0.0)
+                    self.risk_discipline_score = state_data.get("risk_discipline_score", 100.0)
+                    self.equity_history_15m = state_data.get("equity_history_15m", [])
+                    self.last_sharpe_time = state_data.get("last_sharpe_time")
+                    self.deductions_applied = set(state_data.get("deductions_applied", []))
+                print(f"📁 Successfully restored risk state: {len(self.equity_history_15m)} history points.")
+            except Exception as e:
+                print(f"⚠️ Warning: Could not load risk state: {e}")
 
     def check_rate_limit(self) -> bool:
         now = time.time()
@@ -79,22 +118,30 @@ class AssetRiskGuard:
     def calculate_metrics(self, account: AccountState, current_time):
         if account.equity > self.peak_equity:
             self.peak_equity = account.equity
+            self.save_state()
             
         current_dd = (self.peak_equity - account.equity) / self.peak_equity if self.peak_equity > 0 else 0.0
         if current_dd > self.max_drawdown:
             self.max_drawdown = current_dd
+            self.save_state()
             
         leverage = account.gross_exposure / account.equity if account.equity > 0 else 0.0
         margin_usage = account.used_margin / account.equity if account.equity > 0 else 0.0
         
-        if self.last_sharpe_time is None or (current_time - self.last_sharpe_time) >= timedelta(minutes=15):
+        # Clock alignment: Sample equity exactly on 15-minute clock boundaries
+        minute = current_time.minute
+        current_interval_id = f"{current_time.strftime('%Y-%m-%d %H')}:{minute - (minute % 15):02d}"
+        
+        if self.last_sharpe_time is None or self.last_sharpe_time != current_interval_id:
             self.equity_history_15m.append(account.equity)
-            self.last_sharpe_time = current_time
+            self.last_sharpe_time = current_interval_id
+            self.save_state()
             
         return current_dd, leverage, margin_usage
 
     def evaluate_compliance_violations(self, account: AccountState, current_time):
         drawdown, leverage, margin_usage = self.calculate_metrics(account, current_time)
+        state_changed = False
         
         max_asset = None
         max_asset_exposure = 0.0
@@ -107,16 +154,16 @@ class AssetRiskGuard:
         else:
             max_concentration = 0.0
 
-        # --- Margin Violations --- [1]
+        # --- Margin Violations (Rule 13.1) ---
         if margin_usage > 0.90:
             if self.margin_90_start is None: self.margin_90_start = current_time
             elapsed = (current_time - self.margin_90_start).total_seconds() / 60.0
             if elapsed >= 30.0 and "margin_90" not in self.deductions_applied:
                 self.risk_discipline_score = max(0.0, self.risk_discipline_score - 20)
                 self.deductions_applied.add("margin_90")
+                state_changed = True
         else:
             self.margin_90_start = None
-            self.deductions_applied.discard("margin_90")
 
         if margin_usage > 0.95:
             if self.margin_95_start is None: self.margin_95_start = current_time
@@ -124,30 +171,22 @@ class AssetRiskGuard:
             if elapsed >= 15.0 and "margin_95" not in self.deductions_applied:
                 self.risk_discipline_score = max(0.0, self.risk_discipline_score - 30)
                 self.deductions_applied.add("margin_95")
+                state_changed = True
         else:
             self.margin_95_start = None
-            self.deductions_applied.discard("margin_95")
 
-        if margin_usage > 0.98:
-            if self.margin_98_start is None: self.margin_98_start = current_time
-            elapsed = (current_time - self.margin_98_start).total_seconds() / 60.0
-            if elapsed >= 10.0 and "margin_98" not in self.deductions_applied:
-                self.risk_discipline_score = max(0.0, self.risk_discipline_score - 50)
-                self.deductions_applied.add("margin_98")
-        else:
-            self.margin_98_start = None
-            self.deductions_applied.discard("margin_98")
+        # (Margin Usage > 98% only triggers a compliance review; no programmatic score deduction is applied)
 
-        # --- Leverage Violations --- [1]
+        # --- Leverage Violations (Rule 13.2) ---
         if leverage > 28.0:
             if self.leverage_28_start is None: self.leverage_28_start = current_time
             elapsed = (current_time - self.leverage_28_start).total_seconds() / 60.0
             if elapsed >= 30.0 and "leverage_28" not in self.deductions_applied:
                 self.risk_discipline_score = max(0.0, self.risk_discipline_score - 20)
                 self.deductions_applied.add("leverage_28")
+                state_changed = True
         else:
             self.leverage_28_start = None
-            self.deductions_applied.discard("leverage_28")
 
         if leverage > 29.0:
             if self.leverage_29_start is None: self.leverage_29_start = current_time
@@ -155,20 +194,35 @@ class AssetRiskGuard:
             if elapsed >= 15.0 and "leverage_29" not in self.deductions_applied:
                 self.risk_discipline_score = max(0.0, self.risk_discipline_score - 30)
                 self.deductions_applied.add("leverage_29")
+                state_changed = True
         else:
             self.leverage_29_start = None
-            self.deductions_applied.discard("leverage_29")
 
-        # --- Concentration Violations --- [1]
+        # --- Concentration Violations (Rule 13.3) ---
+        # Single-Instrument Exposure Check (>90% for >=30 minutes)
         if max_concentration > 0.90 and leverage > 1.0:
             if self.concentration_90_start is None: self.concentration_90_start = current_time
             elapsed = (current_time - self.concentration_90_start).total_seconds() / 60.0
             if elapsed >= 30.0 and "concentration_90" not in self.deductions_applied:
                 self.risk_discipline_score = max(0.0, self.risk_discipline_score - 10)
                 self.deductions_applied.add("concentration_90")
+                state_changed = True
         else:
             self.concentration_90_start = None
-            self.deductions_applied.discard("concentration_90")
+
+        # Net Directional Exposure Check (>95% for >=30 minutes)
+        if account.net_directional_exposure > 0.95 and leverage > 1.0:
+            if self.directional_95_start is None: self.directional_95_start = current_time
+            elapsed = (current_time - self.directional_95_start).total_seconds() / 60.0
+            if elapsed >= 30.0 and "directional_95" not in self.deductions_applied:
+                self.risk_discipline_score = max(0.0, self.risk_discipline_score - 10)
+                self.deductions_applied.add("directional_95")
+                state_changed = True
+        else:
+            self.directional_95_start = None
+            
+        if state_changed:
+            self.save_state()
 
     def validate_trade(self, account: AccountState, asset: str, trade_size: float, current_time) -> bool:
         if not self.check_rate_limit():
@@ -197,7 +251,6 @@ class AssetRiskGuard:
             return False
             
         projected_leverage = projected_gross_exposure / account.equity
-        projected_concentration = projected_asset_exposure / projected_gross_exposure if projected_gross_exposure > 0 else 0.0
         
         required_margin_rate = self.margin_rates.get(asset_class, 0.0333)
         projected_used_margin = account.used_margin + (trade_size * required_margin_rate)
