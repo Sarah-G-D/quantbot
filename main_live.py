@@ -18,10 +18,9 @@ logfire.configure(
 )
 logfire.instrument_pydantic()
 
+# Restricted asset scope: Forex majors only
 ALLOWED_ASSETS = [
-    "AUDUSD", "EURCHF", "EURGBP", "EURUSD", "GBPUSD", "USDCAD", "USDCHF", "USDJPY",
-    "XAGUSD", "XAUUSD",
-    "BARUSD", "BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD"
+    "AUDUSD", "EURCHF", "EURGBP", "EURUSD", "GBPUSD", "USDCAD", "USDCHF", "USDJPY"
 ]
 
 def load_sentiment_bias() -> str:
@@ -267,10 +266,6 @@ def live_trading_loop():
                 continue  # Skip evaluation during this cycle to allow the order to settle
 
             for symbol in ALLOWED_ASSETS:
-                # Rule 14 Checklist: Bypass BARUSD completely to avoid illiquid execution slippage
-                if symbol == "BARUSD":
-                    continue
-
                 tick = mt5.symbol_info_tick(symbol)
                 if tick is None:
                     continue
@@ -348,4 +343,4 @@ def live_trading_loop():
         print("MetaTrader 5 connection closed.")
 
 if __name__ == "__main__":
-    live_trading_loop()git add main_live.py risk_agent.py
+    live_trading_loop()
