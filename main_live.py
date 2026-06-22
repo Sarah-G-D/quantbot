@@ -4,8 +4,10 @@ import json
 import os
 import requests
 import pandas as pd
+import numpy as np
 import MetaTrader5 as mt5
 import logfire
+from datetime import datetime, timedelta, timezone  # Uses pure standard library
 from alpha_agent import FiveBotAlphaCouncil
 from risk_agent import AssetRiskGuard, AccountState
 
@@ -30,6 +32,12 @@ def load_sentiment_bias() -> str:
     return "NEUTRAL"
 # ---------------------------------------------------------------------------
 
+def get_current_bst_time() -> datetime:
+    """Returns current BST (London) time using pure standard library (no pytz required)."""
+    # BST in June is UTC + 1 hour
+    utc_now = datetime.now(timezone.utc)
+    return utc_now + timedelta(hours=1)
+
 def get_symbol_filling_mode(symbol: str) -> int:
     """Dynamically queries the MT5 terminal for the broker's supported filling mode."""
     info = mt5.symbol_info(symbol)
@@ -37,13 +45,38 @@ def get_symbol_filling_mode(symbol: str) -> int:
         return mt5.ORDER_FILLING_FOK  # Fallback
     
     # Check bitmask flags for supported modes
-    # SYMBOL_FILLING_FOK = 1, SYMBOL_FILLING_IOC = 2
     if (info.filling_mode & 1) != 0: 
         return mt5.ORDER_FILLING_FOK
     elif (info.filling_mode & 2) != 0: 
         return mt5.ORDER_FILLING_IOC
     else:
         return mt5.ORDER_FILLING_RETURN
+
+def calculate_mt5_lot_size(symbol: str, trade_size_cash: float, mid_price: float) -> float:
+    """Calculates MT5 lot size using dynamic contract size and volume limits."""
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return 0.0
+    
+    # Get the contract size (e.g., 100,000 for Forex, 100 for Gold, 1 for BTC)
+    contract_size = info.trade_contract_size
+    
+    # Calculate target units required
+    target_units = trade_size_cash / mid_price
+    
+    # Convert units to lots based on the contract size of the asset
+    raw_lots = target_units / contract_size
+    
+    # Respect MT5 broker volume steps and limits
+    lot_step = info.volume_step if info.volume_step > 0 else 0.01
+    min_lot = info.volume_min if info.volume_min > 0 else 0.01
+    max_lot = info.volume_max if info.volume_max > 0 else 100.0
+    
+    # Round down to the nearest allowed lot step
+    lots = round(raw_lots / lot_step) * lot_step
+    lots = max(min_lot, min(max_lot, lots))
+    
+    return round(lots, 2)
 
 def get_live_book_imbalance(symbol: str) -> float:
     """Fetches Depth of Market from MT5 to compute a live order book imbalance."""
@@ -55,7 +88,6 @@ def get_live_book_imbalance(symbol: str) -> float:
     total_asks = 0.0
     
     for item in items:
-        # Corrected MT5 Python attributes to prevent AttributeError
         if item.type in [mt5.BOOK_TYPE_BUY, mt5.BOOK_TYPE_BUY_MARKET]:
             total_bids += item.volume_dbl if hasattr(item, 'volume_dbl') else item.volume
         elif item.type in [mt5.BOOK_TYPE_SELL, mt5.BOOK_TYPE_SELL_MARKET]:
@@ -81,7 +113,6 @@ def execute_mt5_order(symbol: str, action: str, volume: float, price: float, com
     """Submits a market execution order directly to the MetaTrader 5 terminal."""
     order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
     
-    # Dynamically select the filling mode the broker expects for this asset
     filling_mode = get_symbol_filling_mode(symbol)
     
     request = {
@@ -94,7 +125,7 @@ def execute_mt5_order(symbol: str, action: str, volume: float, price: float, com
         "magic": 123456, 
         "comment": comment,
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": filling_mode, # Dynamically determined
+        "type_filling": filling_mode,
     }
     
     result = mt5.order_send(request)
@@ -135,6 +166,28 @@ def live_trading_loop():
     
     try:
         while True:
+            # ---------------------------------------------------------------------------
+            # SAFEGUARD: AUTO-FLAT 21:45 BST END-OF-ROUND RULE
+            # ---------------------------------------------------------------------------
+            now_bst = get_current_bst_time()
+            if now_bst.hour == 21 and now_bst.minute >= 45:
+                # Check if we have active positions to close
+                active_positions = mt5.positions_get()
+                if active_positions and len(active_positions) > 0:
+                    print("🕒 Approaching Round 1 Cutoff (22:00 BST). Flattening all positions to lock in rank...")
+                    for pos in active_positions:
+                        symbol = pos.symbol
+                        direction = "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
+                        close_action = "SELL" if direction == "BUY" else "BUY"
+                        tick = mt5.symbol_info_tick(symbol)
+                        if tick is not None:
+                            close_price = tick.bid if direction == "BUY" else tick.ask
+                            execute_mt5_order(symbol, close_action, pos.volume, close_price, comment="Cutoff Flat")
+                    print("✅ All positions flattened. Standing secured for Round 1 snapshot.")
+                time.sleep(5)
+                continue
+            # ---------------------------------------------------------------------------
+
             sentiment_bias = load_sentiment_bias()
             
             # Apply sentiment skew directly to strategy properties inside the council
@@ -182,12 +235,26 @@ def live_trading_loop():
                     else:
                         current_return = (entry_price - tick.ask) / entry_price
                         
-                    # Widen brackets to +1.0% (Profit) and -0.5% (Stop Loss) to let trades breathe
-                    if current_return >= 0.010 or current_return <= -0.005:
+                    # Calculate live book imbalance to evaluate the current council consensus
+                    live_imbalance = get_live_book_imbalance(symbol)
+                    mock_row = {
+                        'bid': tick.bid,
+                        'ask': tick.ask,
+                        'book_imbalance': live_imbalance,
+                    }
+                    analysis = council.evaluate_market(mock_row, symbol)
+                    signal = analysis.get("signal")
+                    
+                    # Stateful reversal exit trigger
+                    reversal_triggered = (direction == "BUY" and signal == "SELL") or (direction == "SELL" and signal == "BUY")
+                    
+                    # Exit if brackets hit OR if council votes against us
+                    if current_return >= 0.010 or current_return <= -0.005 or reversal_triggered:
                         close_action = "SELL" if direction == "BUY" else "BUY"
                         close_price = tick.bid if direction == "BUY" else tick.ask
-                        print(f"🛑 [Exit Signal] Closing {symbol} position...")
-                        execute_mt5_order(symbol, close_action, pos.volume, close_price, comment="Exit Bracket")
+                        reason = "Exit Bracket" if not reversal_triggered else "Council Reversal"
+                        print(f"🛑 [Exit Signal] Closing {symbol} position due to {reason}...")
+                        execute_mt5_order(symbol, close_action, pos.volume, close_price, comment=reason)
                         
                 # --- ENTRY EVALUATION ---
                 else:
@@ -209,12 +276,11 @@ def live_trading_loop():
                         is_safe = guard.validate_trade(current_state, symbol, trade_size_cash, current_time)
                         
                         if is_safe:
-                            trade_volume = trade_size_cash / mid_price
-                            mt5_lot_size = round(trade_volume / 100000.0, 2) 
+                            # Use new dynamic lot calculation
+                            mt5_lot_size = calculate_mt5_lot_size(symbol, trade_size_cash, mid_price)
                             
                             if mt5_lot_size > 0:
                                 print(f"🚀 [Entry Signal] Executing {signal} for {symbol} with lots {mt5_lot_size}...")
-                                # Execute entry order on the correct book side: BUY at Ask, SELL at Bid
                                 entry_price_exec = tick.ask if signal == "BUY" else tick.bid
                                 execute_mt5_order(symbol, signal, mt5_lot_size, entry_price_exec, comment="Council Consensus")
             
