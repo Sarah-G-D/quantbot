@@ -30,21 +30,6 @@ def load_sentiment_bias() -> str:
     return "NEUTRAL"
 # ---------------------------------------------------------------------------
 
-def get_symbol_filling_mode(symbol: str) -> int:
-    """Dynamically queries the MT5 terminal for the broker's supported filling mode."""
-    info = mt5.symbol_info(symbol)
-    if info is None:
-        return mt5.ORDER_FILLING_FOK  # Fallback
-    
-    # Check bitmask flags for supported modes
-    # SYMBOL_FILLING_FOK = 1, SYMBOL_FILLING_IOC = 2
-    if (info.filling_mode & 1) != 0: 
-        return mt5.ORDER_FILLING_FOK
-    elif (info.filling_mode & 2) != 0: 
-        return mt5.ORDER_FILLING_IOC
-    else:
-        return mt5.ORDER_FILLING_RETURN
-
 def get_live_book_imbalance(symbol: str) -> float:
     """Fetches Depth of Market from MT5 to compute a live order book imbalance."""
     items = mt5.market_book_get(symbol)
@@ -81,9 +66,6 @@ def execute_mt5_order(symbol: str, action: str, volume: float, price: float, com
     """Submits a market execution order directly to the MetaTrader 5 terminal."""
     order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
     
-    # Dynamically select the filling mode the broker expects for this asset
-    filling_mode = get_symbol_filling_mode(symbol)
-    
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
@@ -94,7 +76,7 @@ def execute_mt5_order(symbol: str, action: str, volume: float, price: float, com
         "magic": 123456, 
         "comment": comment,
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": filling_mode, # Dynamically determined
+        "type_filling": mt5.ORDER_FILLING_FOK, # Corrected: universally supported fill mode
     }
     
     result = mt5.order_send(request)
@@ -178,8 +160,10 @@ def live_trading_loop():
                     
                     # Calculate correct percentage return based on executable order book sides
                     if direction == "BUY":
+                        # We close a BUY position by SELLING at the BID price
                         current_return = (tick.bid - entry_price) / entry_price
                     else:
+                        # We close a SELL position by BUYING at the ASK price
                         current_return = (entry_price - tick.ask) / entry_price
                         
                     # Widen brackets to +1.0% (Profit) and -0.5% (Stop Loss) to let trades breathe
@@ -210,6 +194,7 @@ def live_trading_loop():
                         
                         if is_safe:
                             trade_volume = trade_size_cash / mid_price
+                            # Standard MT5 Lot sizes: $100k exposure is roughly 1 lot
                             mt5_lot_size = round(trade_volume / 100000.0, 2) 
                             
                             if mt5_lot_size > 0:
