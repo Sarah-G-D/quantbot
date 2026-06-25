@@ -16,10 +16,10 @@ logfire.configure(
 )
 logfire.instrument_pydantic()
 
+# Excluded BARUSD, BTCUSD, ETHUSD, SOLUSD, and XRPUSD completely to stop crypto trading
 ALLOWED_ASSETS = [
     "AUDUSD", "EURCHF", "EURGBP", "EURUSD", "GBPUSD", "USDCAD", "USDCHF", "USDJPY",
-    "XAGUSD", "XAUUSD",
-    "BARUSD", "BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD"
+    "XAGUSD", "XAUUSD"
 ]
 
 # ---------------------------------------------------------------------------
@@ -176,6 +176,15 @@ def live_trading_loop():
                     entry_price = pos.price_open
                     direction = "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
                     
+                    # Force exit check based on your customized session timeline constraints
+                    current_time = pd.Timestamp.now()
+                    if guard.should_force_close_live(symbol, current_time):
+                        close_action = "SELL" if direction == "BUY" else "BUY"
+                        close_price = tick.bid if direction == "BUY" else tick.ask
+                        print(f"🚨 [Force Exit] Session target reached! Closing {symbol} position...")
+                        execute_mt5_order(symbol, close_action, pos.volume, close_price, comment="Session Force Exit")
+                        continue
+                    
                     # Calculate correct percentage return based on executable order book sides
                     if direction == "BUY":
                         current_return = (tick.bid - entry_price) / entry_price
@@ -206,7 +215,7 @@ def live_trading_loop():
                         trade_size_cash = 1000000.0 
                         
                         current_time = pd.Timestamp.now()
-                        is_safe = guard.validate_trade(current_state, symbol, trade_size_cash, current_time)
+                        is_safe = guard.validate_trade(current_state, symbol, trade_size_cash, current_time, signal)
                         
                         if is_safe:
                             trade_volume = trade_size_cash / mid_price

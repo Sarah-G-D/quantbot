@@ -1,8 +1,8 @@
 # risk_agent.py
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-import time
+from datetime import datetime, timedelta, time, date
+import time as time_lib
 from pydantic import BaseModel, Field
 
 def calculate_standalone_sharpe(equity_list) -> float:
@@ -62,7 +62,7 @@ class AssetRiskGuard:
         self.request_timestamps = []
 
     def check_rate_limit(self) -> bool:
-        now = time.time()
+        now = time_lib.time()
         self.request_timestamps = [t for t in self.request_timestamps if now - t < 1.0]
         if len(self.request_timestamps) >= self.MAX_RPS:
             return False
@@ -71,11 +71,82 @@ class AssetRiskGuard:
 
     def is_session_liquid(self, symbol: str, current_time) -> bool:
         if any(crypto in symbol for crypto in ["BTC", "ETH", "SOL", "XRP", "BAR"]):
-            return True
+            return False  # Crypto trading is stopped completely
         hour = current_time.hour
         if 21 <= hour < 23:
             return False
         return True
+
+    def is_time_and_side_allowed(self, asset: str, side: str, current_time: datetime) -> bool:
+        """
+        Enforces user-specified session parameters and trade direction constraints.
+        Matches localized system time (BST).
+        """
+        asset_clean = asset.replace("/", "").replace("_", "").upper()
+        side = side.upper()
+        current_date = current_time.date()
+        current_hour_minute = current_time.time()
+
+        # Block Crypto trading entirely
+        if any(crypto in asset_clean for crypto in ["BTC", "ETH", "SOL", "XRP", "BAR"]):
+            return False
+
+        # 1. Forex Session Filters
+        # Stop opening trades after 23:30 on June 25th, 2026
+        if asset_clean in ["AUDUSD", "EURCHF", "EURGBP", "EURUSD", "GBPUSD", "USDCAD", "USDCHF", "USDJPY"]:
+            cutoff_open = datetime(2026, 6, 25, 23, 30)
+            if current_time >= cutoff_open:
+                return False
+            return True
+
+        # 2. XAGUSD Session Filters
+        # Sell-only. Trade until 18:59 on June 25th; trade 07:00 to 11:00 on June 26th.
+        elif asset_clean == "XAGUSD":
+            if side != "SELL":
+                return False
+            if current_date == date(2026, 6, 25):
+                return time(7, 0) <= current_hour_minute <= time(18, 59, 59)
+            elif current_date == date(2026, 6, 26):
+                return time(7, 0) <= current_hour_minute <= time(11, 0, 0)
+            return False
+
+        # 3. XAUUSD Session Filters
+        # Buy/Sell allowed. Trade until 18:59 on June 25th; trade 07:00 to 11:00 on June 26th.
+        elif asset_clean == "XAUUSD":
+            if current_date == date(2026, 6, 25):
+                return time(7, 0) <= current_hour_minute <= time(18, 59, 59)
+            elif current_date == date(2026, 6, 26):
+                return time(7, 0) <= current_hour_minute <= time(11, 0, 0)
+            return False
+
+        return True
+
+    def should_force_close_live(self, asset: str, current_time: datetime) -> bool:
+        """
+        Determines if open assets must be forcefully shut down.
+        """
+        asset_clean = asset.replace("/", "").replace("_", "").upper()
+        current_date = current_time.date()
+
+        # Hard stop for all positions at Friday June 26th, 2026 at 22:00 BST (Competition End)
+        competition_end = datetime(2026, 6, 26, 22, 0)
+        if current_time >= competition_end:
+            return True
+
+        # Forex exits: Close all by 13:00 BST on Friday June 26th, 2026
+        if asset_clean in ["AUDUSD", "EURCHF", "EURGBP", "EURUSD", "GBPUSD", "USDCAD", "USDCHF", "USDJPY"]:
+            forex_exit_time = datetime(2026, 6, 26, 13, 0)
+            if current_time >= forex_exit_time:
+                return True
+
+        # Metals exits: Close all by 11:00 AM BST on Friday June 26th, 2026 (since we trade until 11am)
+        elif asset_clean in ["XAGUSD", "XAUUSD"]:
+            if current_date == date(2026, 6, 26):
+                metals_exit_time = datetime(2026, 6, 26, 11, 0)
+                if current_time >= metals_exit_time:
+                    return True
+
+        return False
 
     def calculate_metrics(self, account: AccountState, current_time):
         if account.equity > self.peak_equity:
@@ -108,7 +179,7 @@ class AssetRiskGuard:
         else:
             max_concentration = 0.0
 
-        # --- Margin Violations --- [1]
+        # --- Margin Violations ---
         if margin_usage > 0.90:
             if self.margin_90_start is None: self.margin_90_start = current_time
             elapsed = (current_time - self.margin_90_start).total_seconds() / 60.0
@@ -139,7 +210,7 @@ class AssetRiskGuard:
             self.margin_98_start = None
             self.deductions_applied.discard("margin_98")
 
-        # --- Leverage Violations --- [1]
+        # --- Leverage Violations ---
         if leverage > 28.0:
             if self.leverage_28_start is None: self.leverage_28_start = current_time
             elapsed = (current_time - self.leverage_28_start).total_seconds() / 60.0
@@ -160,7 +231,7 @@ class AssetRiskGuard:
             self.leverage_29_start = None
             self.deductions_applied.discard("leverage_29")
 
-        # --- Concentration Violations --- [1]
+        # --- Concentration Violations ---
         if max_concentration > 0.90 and leverage > 1.0:
             if self.concentration_90_start is None: self.concentration_90_start = current_time
             elapsed = (current_time - self.concentration_90_start).total_seconds() / 60.0
@@ -171,7 +242,7 @@ class AssetRiskGuard:
             self.concentration_90_start = None
             self.deductions_applied.discard("concentration_90")
 
-    def validate_trade(self, account: AccountState, asset: str, trade_size: float, current_time) -> bool:
+    def validate_trade(self, account: AccountState, asset: str, trade_size: float, current_time, side: str) -> bool:
         if not self.check_rate_limit():
             return False
             
@@ -179,6 +250,10 @@ class AssetRiskGuard:
             return False
             
         if not self.is_session_liquid(asset, current_time):
+            return False
+
+        # Apply user's defined hour-of-day and asset trade direction logic
+        if not self.is_time_and_side_allowed(asset, side, current_time):
             return False
 
         drawdown, leverage, margin_usage = self.calculate_metrics(account, current_time)
